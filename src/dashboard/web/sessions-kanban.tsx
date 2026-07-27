@@ -554,6 +554,20 @@ function ClusterView(props: {
   if (item.type === 'card') return <KanbanCard {...props.cardProps} row={item.row} />;
   const title = chatDisplayTitle(item.rows[0]) ?? item.chatId;
   const dragging = props.dragCluster?.chatId === item.chatId && props.dragCluster.col === props.columnId;
+  // 同群聚簇头部用 bot 头像堆叠替代群头像：一眼看出这个群里有哪些 bot 在干活，
+  // 群名解析失败（只剩 cli_xxx / URL）时也不会出现"空头像 + 难懂 id"的尴尬组合。
+  const clusterBots = new Map<string, { name: string; larkAppId?: string }>();
+  for (const r of item.rows) {
+    const key = String(r.larkAppId || r.botName || 'unknown');
+    if (!clusterBots.has(key)) clusterBots.set(key, { name: botDisplayName(r), larkAppId: r.larkAppId });
+  }
+  const botList = [...clusterBots.values()];
+  const visibleBots = botList.slice(0, 3);
+  const extraCount = botList.length - visibleBots.length;
+  const clusterAvatarHtml = botList.length === 0
+    ? chatAvatarHtml({ chatId: item.chatId, name: title, size: 'sm' })
+    : visibleBots.map(b => botAvatarHtml({ name: b.name, larkAppId: b.larkAppId, size: 'sm' })).join('')
+      + (extraCount > 0 ? `<span class="kanban-cluster-avatar-more">+${extraCount}</span>` : '');
   return (
     <div className={`kanban-cluster${props.expanded ? ' expanded' : ' collapsed'}${dragging ? ' dragging' : ''}`} data-chat={item.chatId}>
       <header
@@ -563,7 +577,7 @@ function ClusterView(props: {
           if (props.columnId) props.onDragStartCluster(item.chatId, props.columnId, event);
         }}
       >
-        <span className="kanban-cluster-avatar" dangerouslySetInnerHTML={rawHtml(chatAvatarHtml({ chatId: item.chatId, name: title, size: 'sm' }))} />
+        <span className={`kanban-cluster-avatar${botList.length > 1 ? ' is-stack' : ''}`} dangerouslySetInnerHTML={rawHtml(clusterAvatarHtml)} />
         <span className="kanban-cluster-name">{title}</span>
         <span className="kanban-cluster-count">{item.rows.length}</span>
         <button

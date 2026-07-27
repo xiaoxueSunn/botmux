@@ -2746,6 +2746,33 @@ button.primary {
   display: inline-flex;
 }
 
+/* 同群聚簇头部 bot 头像堆叠：多个 bot 时轻微重叠，最多展示 3 个，超出用 +N 标记 */
+.kanban-cluster-avatar.is-stack {
+  width: auto;
+  height: 24px;
+  align-items: center;
+}
+.kanban-cluster-avatar.is-stack .orb-avatar {
+  margin-left: -8px;
+  box-shadow: 0 0 0 1.5px var(--surface-raised);
+}
+.kanban-cluster-avatar.is-stack .orb-avatar:first-child {
+  margin-left: 0;
+}
+.kanban-cluster-avatar-more {
+  flex: none;
+  margin-left: 4px;
+  padding: 0 5px;
+  height: 18px;
+  line-height: 18px;
+  border-radius: 9px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .kanban-cluster-toggle svg {
   width: 14px;
   height: 14px;
