@@ -4,7 +4,7 @@ import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } f
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
-import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
+import { homedir, cpus } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
@@ -34,6 +34,10 @@ import {
   type OverloadState,
   type OverloadThresholds,
 } from './core/host-overload-alert.js';
+import {
+  hostOverloadSampleIntervalMs,
+  readHostOverloadSample,
+} from './core/host-overload-sampler.js';
 import { registerOverloadNonce } from './im/lark/overload-nonce.js';
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -19835,8 +19839,9 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
  *   BOTMUX_OVERLOAD_ENTER_MEM_FRAC   / _EXIT_MEM_FRAC      (0..1)
  *   BOTMUX_OVERLOAD_MIN_REALERT_MS
  * Setting BOTMUX_OVERLOAD_ALERT=0 disables the watcher entirely (checked at the
- * call site). Swap is not read on this platform, so its thresholds stay default
- * but are inert (reading passes swap=undefined).
+ * call site). Darwin uses the kernel pressure level for decisions and records
+ * absolute swap/compressor usage for diagnostics; other platforms retain the
+ * existing load + os.freemem path.
  */
 function resolveOverloadThresholds(): OverloadThresholds {
   // Enter thresholds priority (env > global config > default) + hysteresis-safe
@@ -19866,7 +19871,7 @@ function resolveOverloadThresholds(): OverloadThresholds {
  * episode marker in the shared botmux data dir so only the first daemon to see a
  * given edge actually sends; siblings within the dedup window back off.
  *
- * The key is just the edge kind (`entered` / `recovered`): within DEDUP_WINDOW_MS
+ * The key is the edge kind (`entered` / `escalated` / `recovered`): within DEDUP_WINDOW_MS
  * the first daemon to see an edge claims it and siblings back off. (An earlier
  * version bucketed `entered` by `Math.round(load15)`, but sibling daemons
  * sampling load15 either side of an X.5 boundary rounded to different bands,
@@ -19882,8 +19887,8 @@ function resolveOverloadThresholds(): OverloadThresholds {
  * effort: if the lock itself can't be taken (FS error), allow the DM (better a
  * rare duplicate than a silent miss).
  */
-function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
-  const DEDUP_WINDOW_MS = 60_000; // ≥ two 30s ticks; covers sibling daemons racing the same edge.
+function claimOverloadEpisode(kind: 'entered' | 'escalated' | 'recovered'): boolean {
+  const DEDUP_WINDOW_MS = 60_000; // Covers sibling daemons racing the same edge.
   const marker = join(config.session.dataDir, '.overload-episode.json');
   const key = kind;
   try {
@@ -21097,14 +21102,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // (it runs on this host, so no cross-daemon delivery queue is needed) — other
   // daemons no-op and keep their state cleared. load/mem are host-wide; the
   // cross-process episode lock is kept purely as a belt-and-suspenders guard
-  // (e.g. a stale duplicate daemon for the same bot). Reads os.loadavg()[2] +
-  // mem every 30s; on a healthy→overloaded or overloaded→healthy edge it DMs the
-  // notifier bot's admin. Hysteresis + a min re-alert window (see
+  // (e.g. a stale duplicate daemon for the same bot). Darwin reads the kernel
+  // pressure level every 5s; other platforms retain the 30s load/memory sample.
+  // On a notable edge it DMs the notifier bot's admin. Hysteresis + a min re-alert window (see
   // host-overload-alert.ts) keep a load near the line from spamming. Set
   // BOTMUX_OVERLOAD_ALERT=0 to force the whole feature off regardless of config.
   if (process.env.BOTMUX_OVERLOAD_ALERT !== '0') {
     let overloadState: OverloadState = INITIAL_OVERLOAD_STATE;
+    let overloadSampleInFlight = false;
+    const overloadSampleIntervalMs = hostOverloadSampleIntervalMs(process.platform);
     const overloadTimer = setInterval(() => {
+      if (overloadSampleInFlight) return;
+      overloadSampleInFlight = true;
       void (async () => {
       try {
         // Global hot switch + target gating: only the selected notifier bot's
@@ -21116,11 +21125,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // take effect on the next sample without a restart.
         const overloadThresholds = resolveOverloadThresholds();
 
-        const reading = {
-          load15: loadavg()[2] ?? 0,
-          memTotalBytes: totalmem(),
-          memFreeBytes: freemem(),
-        };
+        const reading = await readHostOverloadSample();
         const { nextState, action } = evaluateOverload(overloadState, reading, overloadThresholds, Date.now());
         overloadState = nextState;
         if (!action) return;
@@ -21133,9 +21138,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           return;
         }
         const ownerOpenId = resolvePrimaryOwnerOpenId(cfg.larkAppId);
+        const memoryMetric = action.metrics.memoryPressureLevel
+          ? `pressure=${action.metrics.memoryPressureLevel}`
+          : `mem=${((action.metrics.memUsedFrac ?? 0) * 100).toFixed(0)}%`;
+        const swapMetric = action.metrics.swapUsedBytes === undefined
+          ? ''
+          : ` swapBytes=${action.metrics.swapUsedBytes}`;
+        const compressorMetric = action.metrics.compressorBytesUsed === undefined
+          ? ''
+          : ` compressorBytes=${action.metrics.compressorBytesUsed}`;
         logger.info(
           `[overload] ${action.kind}: load15=${action.metrics.load15.toFixed(2)} `
-          + `perCpu=${action.metrics.loadPerCpu.toFixed(2)} mem=${(action.metrics.memUsedFrac * 100).toFixed(0)}% `
+          + `perCpu=${action.metrics.loadPerCpu.toFixed(2)} ${memoryMetric}${swapMetric}${compressorMetric} `
           + `reasons=[${action.reasons.join(',')}] owner=${ownerOpenId ? 'yes' : 'none'} bot=${cfg.larkAppId}`,
         );
         if (!ownerOpenId) return; // No resolvable owner to DM; the log above still records the edge.
@@ -21146,7 +21160,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // `recovered`: display-only card. On any send failure, fall back to the
         // plain-text alert so the owner still hears about it.
         let cardJson: string;
-        if (action.kind === 'entered') {
+        if (action.kind !== 'recovered') {
           const nonce = randomUUID();
           registerOverloadNonce(nonce);
           let counts = { stopped: 0, idle: 0 };
@@ -21164,9 +21178,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           .catch((err) => logger.warn(`[overload] text fallback DM also failed: ${err instanceof Error ? err.message : String(err)}`));
       } catch (err) {
         logger.warn(`[overload] sample failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        overloadSampleInFlight = false;
       }
       })();
-    }, 30_000);
+    }, overloadSampleIntervalMs);
     overloadTimer.unref?.();
   }
 

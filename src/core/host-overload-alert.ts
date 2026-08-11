@@ -1,3 +1,5 @@
+import type { DarwinMemoryPressureLevel } from './darwin-memory-pressure.js';
+
 /**
  * Host-overload alerting: watch the machine's 15-minute load average and memory
  * pressure, and fire a single Feishu DM to the bot owner when the host crosses
@@ -39,6 +41,8 @@ export interface OverloadThresholds {
   enterSwapUsedFrac: number;
   /** Leave overload only when swap-used fraction <= this. Default 0.25. */
   exitSwapUsedFrac: number;
+  /** A Darwin warning must persist this long before entering overload. */
+  memoryPressureWarningSustainMs: number;
   /**
    * Minimum ms between two "entered" alerts. Even if the state machine leaves
    * and re-enters overload, suppress a fresh entered-alert within this window.
@@ -54,6 +58,7 @@ export const DEFAULT_OVERLOAD_THRESHOLDS: Omit<OverloadThresholds, 'cpuCount'> =
   exitMemUsedFrac: 0.85,
   enterSwapUsedFrac: 0.5,
   exitSwapUsedFrac: 0.25,
+  memoryPressureWarningSustainMs: 10_000,
   minReAlertMs: 15 * 60_000,
 };
 
@@ -183,6 +188,7 @@ export function computeOverloadThresholds(inputs: OverloadThresholdInputs): Over
     exitMemUsedFrac,
     enterSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.enterSwapUsedFrac,
     exitSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.exitSwapUsedFrac,
+    memoryPressureWarningSustainMs: DEFAULT_OVERLOAD_THRESHOLDS.memoryPressureWarningSustainMs,
     minReAlertMs: parseOverloadEnvFloat(env.minReAlertMs, DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs),
   };
 }
@@ -201,21 +207,29 @@ export interface HostReading {
    */
   swapTotalBytes?: number;
   swapUsedBytes?: number;
+  /** Darwin kernel pressure level. Undefined on non-Darwin hosts. */
+  memoryPressureLevel?: DarwinMemoryPressureLevel;
+  /** Current bytes held by the macOS compressor (diagnostic/display only). */
+  compressorBytesUsed?: number;
 }
 
 /** Which dimension(s) tripped the enter threshold — used for the alert copy. */
-export type OverloadReason = 'load' | 'memory' | 'swap';
+export type OverloadReason = 'load' | 'memory' | 'swap' | 'memory_pressure';
 
 export interface OverloadState {
   overloaded: boolean;
   /** ms timestamp of the last "entered" alert we emitted (0 = never). */
   lastEnteredAlertAt: number;
+  /** First tick of the current Darwin warning streak (critical bypasses it). */
+  pressureWarningSince?: number;
+  /** Once true, a critical escalation is not repeated until recovery. */
+  criticalAlerted?: boolean;
 }
 
 export const INITIAL_OVERLOAD_STATE: OverloadState = { overloaded: false, lastEnteredAlertAt: 0 };
 
 export interface OverloadAlertAction {
-  kind: 'entered' | 'recovered';
+  kind: 'entered' | 'escalated' | 'recovered';
   reasons: OverloadReason[];
   reading: HostReading;
   /** Derived, human-friendly numbers for the alert copy. */
@@ -223,8 +237,11 @@ export interface OverloadAlertAction {
     load15: number;
     loadPerCpu: number;
     cpuCount: number;
-    memUsedFrac: number;
+    memUsedFrac: number | undefined;
     swapUsedFrac: number | undefined;
+    memoryPressureLevel: DarwinMemoryPressureLevel | undefined;
+    swapUsedBytes: number | undefined;
+    compressorBytesUsed: number | undefined;
   };
 }
 
@@ -234,8 +251,8 @@ export interface OverloadEvaluation {
   action?: OverloadAlertAction;
 }
 
-function memUsedFrac(reading: HostReading): number {
-  if (reading.memTotalBytes <= 0) return 0;
+function memUsedFrac(reading: HostReading): number | undefined {
+  if (reading.memTotalBytes <= 0) return undefined;
   const used = reading.memTotalBytes - reading.memFreeBytes;
   return Math.max(0, Math.min(1, used / reading.memTotalBytes));
 }
@@ -253,7 +270,8 @@ function swapUsedFrac(reading: HostReading): number | undefined {
 function enterReasons(reading: HostReading, t: OverloadThresholds): OverloadReason[] {
   const reasons: OverloadReason[] = [];
   if (t.cpuCount > 0 && reading.load15 > t.cpuCount * t.enterLoadRatio) reasons.push('load');
-  if (memUsedFrac(reading) >= t.enterMemUsedFrac) reasons.push('memory');
+  const mem = memUsedFrac(reading);
+  if (mem !== undefined && mem >= t.enterMemUsedFrac) reasons.push('memory');
   const swap = swapUsedFrac(reading);
   if (t.enterSwapUsedFrac > 0 && swap !== undefined && swap >= t.enterSwapUsedFrac) reasons.push('swap');
   return reasons;
@@ -266,10 +284,12 @@ function enterReasons(reading: HostReading, t: OverloadThresholds): OverloadReas
  */
 function fullyRecovered(reading: HostReading, t: OverloadThresholds): boolean {
   const loadOk = t.cpuCount <= 0 || reading.load15 <= t.cpuCount * t.exitLoadRatio;
-  const memOk = memUsedFrac(reading) <= t.exitMemUsedFrac;
+  const mem = memUsedFrac(reading);
+  const memOk = mem === undefined || mem <= t.exitMemUsedFrac;
   const swap = swapUsedFrac(reading);
   const swapOk = t.enterSwapUsedFrac <= 0 || swap === undefined || swap <= t.exitSwapUsedFrac;
-  return loadOk && memOk && swapOk;
+  const pressureOk = reading.memoryPressureLevel === undefined || reading.memoryPressureLevel === 'normal';
+  return loadOk && memOk && swapOk && pressureOk;
 }
 
 function metricsFor(reading: HostReading, t: OverloadThresholds): OverloadAlertAction['metrics'] {
@@ -279,6 +299,9 @@ function metricsFor(reading: HostReading, t: OverloadThresholds): OverloadAlertA
     cpuCount: t.cpuCount,
     memUsedFrac: memUsedFrac(reading),
     swapUsedFrac: swapUsedFrac(reading),
+    memoryPressureLevel: reading.memoryPressureLevel,
+    swapUsedBytes: reading.swapUsedBytes,
+    compressorBytesUsed: reading.compressorBytesUsed,
   };
 }
 
@@ -301,14 +324,39 @@ export function evaluateOverload(
   now: number,
 ): OverloadEvaluation {
   const reasons = enterReasons(reading, thresholds);
+  const level = reading.memoryPressureLevel;
+  let pressureWarningSince = prev.pressureWarningSince;
+  let pressureTripped = false;
+  if (level === 'critical') {
+    pressureWarningSince = undefined;
+    pressureTripped = true;
+  } else if (level === 'warning') {
+    pressureWarningSince ??= now;
+    pressureTripped = now - pressureWarningSince >= thresholds.memoryPressureWarningSustainMs;
+  } else {
+    pressureWarningSince = undefined;
+  }
+  if (pressureTripped) reasons.push('memory_pressure');
+
+  const baseState: OverloadState = {
+    ...prev,
+    ...(pressureWarningSince === undefined ? {} : { pressureWarningSince }),
+  };
+  if (pressureWarningSince === undefined) delete baseState.pressureWarningSince;
 
   if (!prev.overloaded) {
-    if (reasons.length === 0) return { nextState: prev };
+    if (reasons.length === 0) return { nextState: baseState };
     // healthy → overloaded edge.
-    const suppressed = now - prev.lastEnteredAlertAt < thresholds.minReAlertMs && prev.lastEnteredAlertAt > 0;
+    // Critical pressure always alerts; the generic cooldown must not suppress
+    // the one signal that may precede a host watchdog panic.
+    const suppressed = level !== 'critical'
+      && now - prev.lastEnteredAlertAt < thresholds.minReAlertMs
+      && prev.lastEnteredAlertAt > 0;
     const nextState: OverloadState = {
+      ...baseState,
       overloaded: true,
       lastEnteredAlertAt: suppressed ? prev.lastEnteredAlertAt : now,
+      criticalAlerted: level === 'critical',
     };
     if (suppressed) return { nextState };
     return {
@@ -317,8 +365,22 @@ export function evaluateOverload(
     };
   }
 
+  // A load or sustained-warning episode can later become critical. Notify once
+  // without changing the existing manual card actions.
+  if (level === 'critical' && prev.criticalAlerted !== true) {
+    return {
+      nextState: { ...baseState, criticalAlerted: true },
+      action: {
+        kind: 'escalated',
+        reasons: reasons.includes('memory_pressure') ? reasons : [...reasons, 'memory_pressure'],
+        reading,
+        metrics: metricsFor(reading, thresholds),
+      },
+    };
+  }
+
   // Currently overloaded: stay until fully recovered.
-  if (!fullyRecovered(reading, thresholds)) return { nextState: prev };
+  if (!fullyRecovered(reading, thresholds)) return { nextState: baseState };
   // overloaded → healthy edge; always announce recovery.
   return {
     nextState: { overloaded: false, lastEnteredAlertAt: prev.lastEnteredAlertAt },
@@ -337,23 +399,53 @@ const REASON_LABEL: Record<OverloadReason, string> = {
   load: 'CPU 负载',
   memory: '内存',
   swap: 'Swap',
+  memory_pressure: 'macOS 内存压力',
 };
+
+function formatBytes(bytes: number): string {
+  const gib = bytes / (1024 ** 3);
+  if (gib >= 1) return gib.toFixed(gib >= 10 ? 1 : 2) + ' GB';
+  return (bytes / (1024 ** 2)).toFixed(0) + ' MB';
+}
+
+function pressureLabel(level: DarwinMemoryPressureLevel): string {
+  if (level === 'critical') return '危急';
+  if (level === 'warning') return '警告';
+  return '正常';
+}
+
+function metricParts(m: OverloadAlertAction['metrics']): string[] {
+  const parts = [
+    `load15 ${m.load15.toFixed(1)} / ${m.cpuCount} 核 = 每核 ${m.loadPerCpu.toFixed(2)}`,
+  ];
+  if (m.memoryPressureLevel !== undefined) {
+    parts.push(`macOS 内存压力${pressureLabel(m.memoryPressureLevel)}`);
+  } else if (m.memUsedFrac !== undefined) {
+    parts.push(`内存已用 ${(m.memUsedFrac * 100).toFixed(0)}%`);
+  }
+  if (m.swapUsedBytes !== undefined) {
+    parts.push(`Swap 已用 ${formatBytes(m.swapUsedBytes)}`);
+  } else if (m.swapUsedFrac !== undefined) {
+    parts.push(`Swap ${(m.swapUsedFrac * 100).toFixed(0)}%`);
+  }
+  if (m.compressorBytesUsed !== undefined) {
+    parts.push(`压缩内存 ${formatBytes(m.compressorBytesUsed)}`);
+  }
+  return parts;
+}
 
 /** Build the Feishu text body for an alert action. Kept here so it's testable. */
 export function formatOverloadAlert(action: OverloadAlertAction, hostLabel?: string): string {
-  const m = action.metrics;
   const host = hostLabel ? `（${hostLabel}）` : '';
-  const load = `load15 ${m.load15.toFixed(1)} / ${m.cpuCount} 核 = 每核 ${m.loadPerCpu.toFixed(2)}`;
-  const mem = `内存已用 ${(m.memUsedFrac * 100).toFixed(0)}%`;
-  const swap = m.swapUsedFrac === undefined ? '' : ` · Swap ${(m.swapUsedFrac * 100).toFixed(0)}%`;
+  const metrics = metricParts(action.metrics).join(' · ');
   if (action.kind === 'recovered') {
-    return `✅ 机器负载已恢复${host}\n${load} · ${mem}${swap}\n（botmux 会话可以正常冷启动了）`;
+    return `✅ 机器负载已恢复${host}\n${metrics}\n（botmux 会话可以正常冷启动了）`;
   }
   const why = action.reasons.map(r => REASON_LABEL[r]).join(' + ') || '资源';
   return (
     `⚠️ 机器过载告警${host}\n` +
     `触发维度：${why}\n` +
-    `${load} · ${mem}${swap}\n` +
+    `${metrics}\n` +
     `此时 botmux 会话冷启动可能超时假死。建议：\`botmux delete stopped\` 清僵尸、挂起闲置会话、或调低各 bot 的 maxLiveWorkers。`
   );
 }
@@ -369,10 +461,7 @@ export const OVERLOAD_ACTION_NOOP = 'overload_noop';
 
 /** One-line metrics summary reused by both the text and card renderers. */
 function metricsLine(m: OverloadAlertAction['metrics']): string {
-  const load = `load15 ${m.load15.toFixed(1)} / ${m.cpuCount} 核 = 每核 ${m.loadPerCpu.toFixed(2)}`;
-  const mem = `内存已用 ${(m.memUsedFrac * 100).toFixed(0)}%`;
-  const swap = m.swapUsedFrac === undefined ? '' : ` · Swap ${(m.swapUsedFrac * 100).toFixed(0)}%`;
-  return `${load} · ${mem}${swap}`;
+  return metricParts(m).join(' · ');
 }
 
 /**
@@ -386,8 +475,11 @@ export interface OverloadCardState {
   /** metrics for the summary line (kept compact). */
   load15: number;
   cpu: number;
-  mem: number; // used fraction 0..1
+  mem?: number; // used fraction 0..1; absent on Darwin
   swap?: number; // used fraction 0..1, optional
+  pressure?: DarwinMemoryPressureLevel;
+  swapUsedBytes?: number;
+  compressorBytesUsed?: number;
   reasons: OverloadReason[];
   /** machine-wide candidate counts (refreshed on every rebuild). */
   stopped: number;
@@ -399,10 +491,16 @@ export interface OverloadCardState {
 
 /** Build the machine-wide summary/metrics line from card state. */
 function stateMetricsLine(st: OverloadCardState): string {
-  const load = `load15 ${st.load15.toFixed(1)} / ${st.cpu} 核 = 每核 ${(st.cpu > 0 ? st.load15 / st.cpu : 0).toFixed(2)}`;
-  const mem = `内存已用 ${(st.mem * 100).toFixed(0)}%`;
-  const swap = st.swap === undefined ? '' : ` · Swap ${(st.swap * 100).toFixed(0)}%`;
-  return `${load} · ${mem}${swap}`;
+  return metricParts({
+    load15: st.load15,
+    loadPerCpu: st.cpu > 0 ? st.load15 / st.cpu : 0,
+    cpuCount: st.cpu,
+    memUsedFrac: st.mem,
+    swapUsedFrac: st.swap,
+    memoryPressureLevel: st.pressure,
+    swapUsedBytes: st.swapUsedBytes,
+    compressorBytesUsed: st.compressorBytesUsed,
+  }).join(' · ');
 }
 
 /** Seed initial card state from an `entered` action + counts + nonce. */
@@ -415,8 +513,13 @@ export function initialOverloadCardState(
     nonce,
     load15: action.metrics.load15,
     cpu: action.metrics.cpuCount,
-    mem: action.metrics.memUsedFrac,
+    ...(action.metrics.memUsedFrac === undefined ? {} : { mem: action.metrics.memUsedFrac }),
     ...(action.metrics.swapUsedFrac === undefined ? {} : { swap: action.metrics.swapUsedFrac }),
+    ...(action.metrics.memoryPressureLevel === undefined ? {} : { pressure: action.metrics.memoryPressureLevel }),
+    ...(action.metrics.swapUsedBytes === undefined ? {} : { swapUsedBytes: action.metrics.swapUsedBytes }),
+    ...(action.metrics.compressorBytesUsed === undefined
+      ? {}
+      : { compressorBytesUsed: action.metrics.compressorBytesUsed }),
     reasons: action.reasons,
     stopped: counts.stopped,
     idle: counts.idle,
@@ -460,7 +563,10 @@ export function buildOverloadAlertCard(st: OverloadCardState, hostLabel?: string
 
   return JSON.stringify({
     config: { wide_screen_mode: true },
-    header: { template: 'red', title: { tag: 'plain_text', content: `⚠️ 机器过载告警${host}` } },
+    header: {
+      template: st.pressure === 'warning' ? 'orange' : 'red',
+      title: { tag: 'plain_text', content: `⚠️ 机器过载告警${host}` },
+    },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**触发维度：**${why}\n${stateMetricsLine(st)}` } },
       { tag: 'div', text: { tag: 'lark_md', content: `当前可降压：**僵尸会话 ${st.stopped} 个** · **闲置会话 ${st.idle} 个**` } },
